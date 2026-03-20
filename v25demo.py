@@ -353,9 +353,14 @@ def calibrate_model_params():
                         # Çok az sinyal üretip şişirme olmasın
                         if met['signals'] < 6:
                             continue
-                        cand = (obj, met['precision'], met['recall'], -met['fp'], params, met)
-                        if best is None or cand > best:
-                            best = cand
+                        # dict'leri tuple karşılaştırmasına sokma (TypeError önleme)
+                        if best is None:
+                            best = (obj, met['precision'], met['recall'], -met['fp'], params, met)
+                        else:
+                            best_key = (best[0], best[1], best[2], best[3])
+                            cand_key = (obj, met['precision'], met['recall'], -met['fp'])
+                            if cand_key > best_key:
+                                best = (obj, met['precision'], met['recall'], -met['fp'], params, met)
 
     if best is None:
         chosen = {'k': 21, 'alpha': 0.65, 'knn_other_weight': 0.60,
