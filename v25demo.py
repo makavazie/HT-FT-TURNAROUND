@@ -1,5 +1,6 @@
 import time
 import re
+import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, simpledialog
 import pandas as pd
@@ -1068,25 +1069,58 @@ def show_stats():
     messagebox.showinfo("Arşiv İstatistikleri", "\n".join(stats_lines))
 
 
-def run_analysis():
-    url = url_entry.get().strip()
-    if not url:
-        messagebox.showwarning("Uyarı", "Lütfen URL girin!")
-        return
-    output_box.delete(1.0, tk.END)
-    output_box.insert(tk.END, "⏳ Analiz ediliyor...\n")
-    root.update()
+_analysis_running = False
+
+
+def _set_analysis_busy(is_busy: bool):
+    """Analiz sırasında UI kilitle/aç."""
+    global _analysis_running
+    _analysis_running = is_busy
+    try:
+        btn_analiz.configure(state=("disabled" if is_busy else "normal"))
+    except Exception:
+        pass
+
+
+def _analysis_worker(url):
+    driver = None
     try:
         driver = get_driver()
         driver.get(url)
         time.sleep(7)
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        driver.quit()
         result = analyze_match(soup, url)
-        output_box.delete(1.0, tk.END)
-        output_box.insert(tk.END, result)
+        root.after(0, lambda: (
+            output_box.delete(1.0, tk.END),
+            output_box.insert(tk.END, result),
+            _set_analysis_busy(False)
+        ))
     except Exception as e:
-        messagebox.showerror("Hata", f"Analiz sırasında hata:\n{str(e)}")
+        err = str(e)
+        root.after(0, lambda: (
+            _set_analysis_busy(False),
+            messagebox.showerror("Hata", f"Analiz sırasında hata:\n{err}")
+        ))
+    finally:
+        try:
+            if driver is not None:
+                driver.quit()
+        except Exception:
+            pass
+
+
+def run_analysis():
+    url = url_entry.get().strip()
+    if not url:
+        messagebox.showwarning("Uyarı", "Lütfen URL girin!")
+        return
+    if _analysis_running:
+        messagebox.showinfo("Bilgi", "Analiz zaten çalışıyor, lütfen bekleyin.")
+        return
+    output_box.delete(1.0, tk.END)
+    output_box.insert(tk.END, "⏳ Analiz ediliyor...\n")
+    _set_analysis_busy(True)
+    threading.Thread(target=_analysis_worker, args=(url,), daemon=True).start()
 
 
 # ══════════════════════════════════════════════
