@@ -328,7 +328,12 @@ def calibrate_model_params():
         }
         return _model_cache
 
-    best = None
+    best_obj = None
+    best_prec = -1.0
+    best_rec = -1.0
+    best_neg_fp = float("-inf")
+    best_params = None
+    best_metrics = None
     grid_k = [13, 17, 21, 25]
     grid_alpha = [0.55, 0.65, 0.75]
     grid_gate_p = [0.45, 0.47, 0.50, 0.53]
@@ -353,16 +358,27 @@ def calibrate_model_params():
                         # Çok az sinyal üretip şişirme olmasın
                         if met['signals'] < 6:
                             continue
-                        # dict'leri tuple karşılaştırmasına sokma (TypeError önleme)
-                        if best is None:
-                            best = (obj, met['precision'], met['recall'], -met['fp'], params, met)
-                        else:
-                            best_key = (best[0], best[1], best[2], best[3])
-                            cand_key = (obj, met['precision'], met['recall'], -met['fp'])
-                            if cand_key > best_key:
-                                best = (obj, met['precision'], met['recall'], -met['fp'], params, met)
+                        cand_obj = float(obj)
+                        cand_prec = float(met['precision'])
+                        cand_rec = float(met['recall'])
+                        cand_neg_fp = float(-met['fp'])
 
-    if best is None:
+                        is_better = (
+                            best_obj is None or
+                            (cand_obj > best_obj) or
+                            (cand_obj == best_obj and cand_prec > best_prec) or
+                            (cand_obj == best_obj and cand_prec == best_prec and cand_rec > best_rec) or
+                            (cand_obj == best_obj and cand_prec == best_prec and cand_rec == best_rec and cand_neg_fp > best_neg_fp)
+                        )
+                        if is_better:
+                            best_obj = cand_obj
+                            best_prec = cand_prec
+                            best_rec = cand_rec
+                            best_neg_fp = cand_neg_fp
+                            best_params = params
+                            best_metrics = met
+
+    if best_params is None:
         chosen = {'k': 21, 'alpha': 0.65, 'knn_other_weight': 0.60,
                   'gate_p': 0.47, 'gate_margin': 0.12, 'gate_other': 0.55,
                   'iqr_floor': 10.0}
@@ -371,8 +387,8 @@ def calibrate_model_params():
         return _model_cache
 
     _model_cache = {
-        'params': best[4],
-        'metrics': best[5],
+        'params': best_params,
+        'metrics': best_metrics,
         'calibrated': True
     }
     return _model_cache
