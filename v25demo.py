@@ -63,6 +63,7 @@ _NEIGHBOR_FILES = [
 ]
 
 _neighbor_cache = None  # Performans için tek seferinde yükle
+_model_cache = None     # Backtest ile kalibre edilen parametre cache'i
 
 def _load_combined_archive():
     """Tüm arşiv dosyalarını yükle, birleştir ve cache'le."""
@@ -162,7 +163,217 @@ def _sigmoid(x):
     return 1.0 / (1.0 + math.exp(-x))
 
 
-def estimate_turnaround_probabilities(ht_diff, ft_diff, asym, str_diff, k=21):
+def _estimate_probs_core(arc, ht_diff, ft_diff, asym, str_diff, params):
+    """Verilen arşiv dataframe'i ile olasılık hesaplayıcı çekirdek."""
+    feat_cols = ['HT Diff_f', 'FT Diff_f', 'Asymmetry_f', 'Str Diff_f']
+    iqr_floor = float(params.get('iqr_floor', 10.0))
+    k = int(params.get('k', 21))
+    alpha = float(params.get('alpha', 0.65))  # kNN harman ağırlığı
+    knn_other_weight = float(params.get('knn_other_weight', 0.60))
+
+    # Robust ölçek (IQR) — outlier etkisini azaltır
+    scales = {}
+    for c in feat_cols:
+        q1 = arc[c].quantile(0.25)
+        q3 = arc[c].quantile(0.75)
+        iqr = float(q3 - q1)
+        scales[c] = iqr if iqr > 1e-6 else iqr_floor
+
+    q = {'HT Diff_f': ht_diff, 'FT Diff_f': ft_diff, 'Asymmetry_f': asym, 'Str Diff_f': str_diff}
+    arc2 = arc.copy()
+    arc2['_dist'] = arc2.apply(
+        lambda r: sum(((r[c] - q[c]) / scales[c]) ** 2 for c in feat_cols) ** 0.5,
+        axis=1
+    )
+
+    top = arc2.nsmallest(max(5, min(k, len(arc2))), '_dist').copy()
+    top['_w'] = 1.0 / (0.35 + top['_dist'])  # çok yakın komşular daha ağır
+    tot_w = float(top['_w'].sum()) or 1.0
+
+    w12 = float(top.loc[top['actual'] == '1/2', '_w'].sum())
+    w21 = float(top.loc[top['actual'] == '2/1', '_w'].sum())
+    wot = max(tot_w - (w12 + w21), 0.0)
+    knn_12, knn_21, knn_other = w12 / tot_w, w21 / tot_w, wot / tot_w
+
+    # Domain pattern score (soft rules): hard-threshold yerine puan yaklaşımı
+    pat_12 = (
+        0.35 * _sigmoid((-str_diff - 9) / 5.5) +
+        0.25 * _sigmoid((10 - asym) / 4.5) +
+        0.20 * _sigmoid((-ft_diff - 4) / 6.0) +
+        0.20 * _sigmoid((-ht_diff + 2) / 7.0)
+    )
+    pat_21 = (
+        0.30 * _sigmoid((str_diff - 9) / 5.0) +
+        0.25 * _sigmoid((ht_diff - 4) / 6.0) +
+        0.25 * _sigmoid((ft_diff - 10) / 6.0) +
+        0.20 * _sigmoid((18 - asym) / 5.0)
+    )
+
+    p12 = alpha * knn_12 + (1 - alpha) * pat_12
+    p21 = alpha * knn_21 + (1 - alpha) * pat_21
+
+    # normalize
+    s = p12 + p21 + (knn_other_weight * knn_other)
+    if s <= 1e-9:
+        return {
+            'p_12': 0.0, 'p_21': 0.0, 'p_other': 1.0,
+            'knn_12': knn_12, 'knn_21': knn_21, 'pat_12': pat_12, 'pat_21': pat_21
+        }
+    p12n = p12 / s
+    p21n = p21 / s
+    pother = max(0.0, 1.0 - (p12n + p21n))
+    return {
+        'p_12': p12n, 'p_21': p21n, 'p_other': pother,
+        'knn_12': knn_12, 'knn_21': knn_21, 'pat_12': pat_12, 'pat_21': pat_21
+    }
+
+
+def _evaluate_backtest(arc, params):
+    """
+    Leave-one-out benzeri basit backtest skoru.
+    Döner: (objective, metrics_dict)
+    """
+    min_train = 18
+    tp = fp = fn = 0
+    sig = 0
+    turnaround_total = 0
+    used = 0
+
+    gate_p = float(params['gate_p'])
+    gate_margin = float(params['gate_margin'])
+    gate_other = float(params['gate_other'])
+
+    for idx in range(len(arc)):
+        row = arc.iloc[idx]
+        actual = row['actual']
+        is_turn = actual in ('1/2', '2/1')
+        if is_turn:
+            turnaround_total += 1
+
+        train = arc.drop(arc.index[idx])
+        if len(train) < min_train:
+            continue
+
+        probs = _estimate_probs_core(
+            train,
+            row['HT Diff_f'],
+            row['FT Diff_f'],
+            row['Asymmetry_f'],
+            row['Str Diff_f'],
+            params
+        )
+        p12, p21, pother = probs['p_12'], probs['p_21'], probs['p_other']
+        top_dir = '1/2' if p12 >= p21 else '2/1'
+        top_p = max(p12, p21)
+        margin = abs(p12 - p21)
+        signal = (top_p >= gate_p and margin >= gate_margin and pother <= gate_other)
+        used += 1
+
+        if signal:
+            sig += 1
+            if actual == top_dir:
+                tp += 1
+            else:
+                fp += 1
+        else:
+            if is_turn:
+                fn += 1
+
+    precision = (tp / sig) if sig else 0.0
+    recall = (tp / turnaround_total) if turnaround_total else 0.0
+    signal_rate = (sig / used) if used else 0.0
+
+    # Amaç: yüksek precision + makul recall + aşırı sinyal cezası
+    objective = (
+        precision * 0.62 +
+        recall * 0.33 -
+        max(signal_rate - 0.42, 0) * 0.10
+    )
+    metrics = {
+        'tp': tp, 'fp': fp, 'fn': fn, 'signals': sig,
+        'precision': precision, 'recall': recall, 'signal_rate': signal_rate, 'used': used
+    }
+    return objective, metrics
+
+
+def calibrate_model_params():
+    """
+    eğit.xlsx + v25demo.xlsx (ve varsa mantikli.xlsx) üzerinden basit grid-search kalibrasyonu.
+    Sonucu cache'ler.
+    """
+    global _model_cache
+    if _model_cache is not None:
+        return _model_cache
+
+    arc = _load_combined_archive().copy()
+    req = ['HT Diff_f', 'FT Diff_f', 'Asymmetry_f', 'Str Diff_f', 'actual']
+    if arc.empty or any(c not in arc.columns for c in req):
+        _model_cache = {
+            'params': {'k': 21, 'alpha': 0.65, 'knn_other_weight': 0.60,
+                       'gate_p': 0.47, 'gate_margin': 0.12, 'gate_other': 0.55,
+                       'iqr_floor': 10.0},
+            'metrics': {'precision': 0.0, 'recall': 0.0, 'signals': 0, 'used': 0},
+            'calibrated': False
+        }
+        return _model_cache
+
+    arc = arc[req].dropna()
+    if len(arc) < 25:
+        _model_cache = {
+            'params': {'k': 21, 'alpha': 0.65, 'knn_other_weight': 0.60,
+                       'gate_p': 0.47, 'gate_margin': 0.12, 'gate_other': 0.55,
+                       'iqr_floor': 10.0},
+            'metrics': {'precision': 0.0, 'recall': 0.0, 'signals': 0, 'used': len(arc)},
+            'calibrated': False
+        }
+        return _model_cache
+
+    best = None
+    grid_k = [13, 17, 21, 25]
+    grid_alpha = [0.55, 0.65, 0.75]
+    grid_gate_p = [0.45, 0.47, 0.50, 0.53]
+    grid_margin = [0.10, 0.12, 0.15]
+    grid_gate_other = [0.50, 0.55, 0.60]
+
+    for k in grid_k:
+        for alpha in grid_alpha:
+            for gp in grid_gate_p:
+                for gm in grid_margin:
+                    for go in grid_gate_other:
+                        params = {
+                            'k': k,
+                            'alpha': alpha,
+                            'knn_other_weight': 0.60,
+                            'gate_p': gp,
+                            'gate_margin': gm,
+                            'gate_other': go,
+                            'iqr_floor': 10.0
+                        }
+                        obj, met = _evaluate_backtest(arc, params)
+                        # Çok az sinyal üretip şişirme olmasın
+                        if met['signals'] < 6:
+                            continue
+                        cand = (obj, met['precision'], met['recall'], -met['fp'], params, met)
+                        if best is None or cand > best:
+                            best = cand
+
+    if best is None:
+        chosen = {'k': 21, 'alpha': 0.65, 'knn_other_weight': 0.60,
+                  'gate_p': 0.47, 'gate_margin': 0.12, 'gate_other': 0.55,
+                  'iqr_floor': 10.0}
+        _, met = _evaluate_backtest(arc, chosen)
+        _model_cache = {'params': chosen, 'metrics': met, 'calibrated': False}
+        return _model_cache
+
+    _model_cache = {
+        'params': best[4],
+        'metrics': best[5],
+        'calibrated': True
+    }
+    return _model_cache
+
+
+def estimate_turnaround_probabilities(ht_diff, ft_diff, asym, str_diff):
     """
     Arşiv + pre-match metriklerle 1/2 ve 2/1 olasılıklarını tahmin eder.
     Yöntem:
@@ -187,62 +398,8 @@ def estimate_turnaround_probabilities(ht_diff, ft_diff, asym, str_diff, k=21):
             'knn_12': 0.0, 'knn_21': 0.0, 'pat_12': 0.0, 'pat_21': 0.0
         }
 
-    feat_cols = ['HT Diff_f', 'FT Diff_f', 'Asymmetry_f', 'Str Diff_f']
-
-    # Robust ölçek (IQR) — outlier etkisini azaltır
-    scales = {}
-    for c in feat_cols:
-        q1 = arc[c].quantile(0.25)
-        q3 = arc[c].quantile(0.75)
-        iqr = float(q3 - q1)
-        scales[c] = iqr if iqr > 1e-6 else 10.0
-
-    q = {'HT Diff_f': ht_diff, 'FT Diff_f': ft_diff, 'Asymmetry_f': asym, 'Str Diff_f': str_diff}
-    arc['_dist'] = arc.apply(
-        lambda r: sum(((r[c] - q[c]) / scales[c]) ** 2 for c in feat_cols) ** 0.5,
-        axis=1
-    )
-
-    top = arc.nsmallest(max(5, min(k, len(arc))), '_dist').copy()
-    top['_w'] = 1.0 / (0.35 + top['_dist'])  # çok yakın komşular daha ağır
-    tot_w = float(top['_w'].sum()) or 1.0
-
-    w12 = float(top.loc[top['actual'] == '1/2', '_w'].sum())
-    w21 = float(top.loc[top['actual'] == '2/1', '_w'].sum())
-    wot = max(tot_w - (w12 + w21), 0.0)
-    knn_12, knn_21, knn_other = w12 / tot_w, w21 / tot_w, wot / tot_w
-
-    # Domain pattern score (soft rules): hard-threshold yerine puan yaklaşımı
-    pat_12 = (
-        0.35 * _sigmoid((-str_diff - 9) / 5.5) +
-        0.25 * _sigmoid((10 - asym) / 4.5) +
-        0.20 * _sigmoid((-ft_diff - 4) / 6.0) +
-        0.20 * _sigmoid((-ht_diff + 2) / 7.0)
-    )
-    pat_21 = (
-        0.30 * _sigmoid((str_diff - 9) / 5.0) +
-        0.25 * _sigmoid((ht_diff - 4) / 6.0) +
-        0.25 * _sigmoid((ft_diff - 10) / 6.0) +
-        0.20 * _sigmoid((18 - asym) / 5.0)
-    )
-
-    p12 = 0.65 * knn_12 + 0.35 * pat_12
-    p21 = 0.65 * knn_21 + 0.35 * pat_21
-
-    # normalize
-    s = p12 + p21 + (0.60 * knn_other)
-    if s <= 1e-9:
-        return {
-            'p_12': 0.0, 'p_21': 0.0, 'p_other': 1.0,
-            'knn_12': knn_12, 'knn_21': knn_21, 'pat_12': pat_12, 'pat_21': pat_21
-        }
-    p12n = p12 / s
-    p21n = p21 / s
-    pother = max(0.0, 1.0 - (p12n + p21n))
-    return {
-        'p_12': p12n, 'p_21': p21n, 'p_other': pother,
-        'knn_12': knn_12, 'knn_21': knn_21, 'pat_12': pat_12, 'pat_21': pat_21
-    }
+    model = calibrate_model_params()
+    return _estimate_probs_core(arc, ht_diff, ft_diff, asym, str_diff, model['params'])
 
 
 def format_neighbors(neighbors, decision):
@@ -464,6 +621,9 @@ def analyze_match(soup, url):
     #    2/1-N : Str≥10 + HT≥15 + FT≥10 → Ev her metrikte üstün
     # ════════════════════════════════════════════════════════
 
+    model_info = calibrate_model_params()
+    model_params = model_info['params']
+    model_metrics = model_info['metrics']
     probs = estimate_turnaround_probabilities(diff_ht_pct, diff_ft_pct, asymmetry, diff_str)
     p12 = probs['p_12']; p21 = probs['p_21']; pother = probs['p_other']
     knn12 = probs['knn_12']; knn21 = probs['knn_21']
@@ -475,7 +635,11 @@ def analyze_match(soup, url):
     margin = top_p - second_p
 
     # Kalibrasyon: Yüksek diğer olasılığı veya düşük margin => PAS
-    signal_gate = (top_p >= 0.47 and margin >= 0.12 and pother <= 0.55)
+    signal_gate = (
+        top_p >= float(model_params['gate_p']) and
+        margin >= float(model_params['gate_margin']) and
+        pother <= float(model_params['gate_other'])
+    )
 
     if signal_gate and top_dir == "1/2":
         decision = "İY/MS 1/2"; level = "⚠️ 1/2-PRO — PROBABILISTIC EDGE"
@@ -515,6 +679,7 @@ def analyze_match(soup, url):
             f"\n⚪ V24 — TURNAROUND BEKLENMİYOR\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Eşik geçilmedi: Pmax=%{top_p*100:.1f}, margin=%{margin*100:.1f}, P(other)=%{pother*100:.1f}\n"
+            f"  Model eşikleri: P≥{model_params['gate_p']:.2f}, M≥{model_params['gate_margin']:.2f}, O≤{model_params['gate_other']:.2f}\n"
             f"  HT={diff_ht_pct:+.1f}%  FT={diff_ft_pct:+.1f}%  Asym={asymmetry:.1f}%  Str={diff_str:+d}"
         )
     else:
@@ -567,7 +732,11 @@ def analyze_match(soup, url):
         f"{neighbor_text}\n"
         f"{'─'*80}\n"
         f"ℹ️  V25 DEMO — Yeni metodoloji | %60 Last6 + %40 Sezon Home/Away\n"
-        f"    Motor: Robust kNN (%65) + Soft Pattern Score (%35) + risk kapısı (Pmax/margin/Pother)\n"
+        f"    Motor: Backtest-kalibre Robust kNN + Soft Pattern + risk kapısı\n"
+        f"    Parametreler: k={model_params['k']} | α={model_params['alpha']:.2f} | "
+        f"P≥{model_params['gate_p']:.2f}, M≥{model_params['gate_margin']:.2f}, O≤{model_params['gate_other']:.2f}\n"
+        f"    Backtest: prec=%{model_metrics.get('precision',0)*100:.1f} "
+        f"| recall=%{model_metrics.get('recall',0)*100:.1f} | sinyal={model_metrics.get('signals',0)}\n"
         f"    Komşu filtresi: k3≥1 | ⚠️  DEMO — Veri birikince eşikler yeniden kalibre edilmeli\n"
         f"{'═'*80}"
     )
