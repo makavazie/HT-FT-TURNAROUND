@@ -7,6 +7,9 @@ import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 
 # ================== V25 HT/FT TURNAROUND SİSTEMİ — DEMO ==================
@@ -1082,13 +1085,38 @@ def _set_analysis_busy(is_busy: bool):
         pass
 
 
+def _append_output(msg):
+    try:
+        output_box.insert(tk.END, msg)
+        output_box.see(tk.END)
+    except Exception:
+        pass
+
+
 def _analysis_worker(url):
     driver = None
     try:
+        root.after(0, lambda: _append_output("🌐 Sayfa açılıyor...\n"))
         driver = get_driver()
         driver.get(url)
-        time.sleep(7)
+        # Kritik bloklar yüklenene kadar bekle (maks 20 sn)
+        try:
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#fbheader"))
+            )
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#strengthChart"))
+            )
+        except Exception:
+            # Tam yüklenmediyse kısa ekstra bekleme yapıp yine de parse etmeyi dene
+            time.sleep(4)
+
+        root.after(0, lambda: _append_output("📥 Veriler okunuyor...\n"))
         soup = BeautifulSoup(driver.page_source, "html.parser")
+        if not soup.select_one("#fbheader"):
+            raise RuntimeError("Maç başlığı okunamadı (#fbheader bulunamadı).")
+
+        root.after(0, lambda: _append_output("🧠 Model hesaplıyor...\n"))
         result = analyze_match(soup, url)
         root.after(0, lambda: (
             output_box.delete(1.0, tk.END),
