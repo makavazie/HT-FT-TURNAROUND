@@ -53,7 +53,10 @@ ARCHIVE_XLSX = "v25demo.xlsx"
 # ── BİRLEŞİK ARŞİV DOSYALARI ──────────────────────────────────────────────
 # Tüm geçmiş Excel arşivleri — komşu analizinde kullanılır
 _NEIGHBOR_FILES = [
-
+    # Önce proje içindeki dosyalar, sonra eski mutlak path'ler
+    "mantikli.xlsx",
+    "eğit.xlsx",
+    "v25demo.xlsx",
     r"C:\Users\Makavazie\Desktop\pp\nowgoal\yeni\yeni\mantikli.xlsx",
     r"C:\Users\Makavazie\Desktop\pp\nowgoal\yeni\yeni\eğit.xlsx",
     r"C:\Users\Makavazie\Desktop\pp\nowgoal\yeni\yeni\v25demo.xlsx",
@@ -147,6 +150,99 @@ def find_neighbors(ht_diff, ft_diff, asym, str_diff, n=5):
             row.get('Match', '?')
         ))
     return results
+
+
+def _sigmoid(x):
+    """Sayısal stabil, hızlı sigmoid."""
+    if x > 50:
+        return 1.0
+    if x < -50:
+        return 0.0
+    import math
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def estimate_turnaround_probabilities(ht_diff, ft_diff, asym, str_diff, k=21):
+    """
+    Arşiv + pre-match metriklerle 1/2 ve 2/1 olasılıklarını tahmin eder.
+    Yöntem:
+      1) Robust ölçekli distance-weighted kNN olasılığı
+      2) Domain pattern skoru (form + güç tutarlılığı)
+      3) Harmanlama (kNN %65, pattern %35)
+    Döner:
+      {p_12, p_21, p_other, knn_12, knn_21, pat_12, pat_21}
+    """
+    arc = _load_combined_archive().copy()
+    req = ['HT Diff_f', 'FT Diff_f', 'Asymmetry_f', 'Str Diff_f', 'actual']
+    if arc.empty or any(c not in arc.columns for c in req):
+        return {
+            'p_12': 0.0, 'p_21': 0.0, 'p_other': 1.0,
+            'knn_12': 0.0, 'knn_21': 0.0, 'pat_12': 0.0, 'pat_21': 0.0
+        }
+
+    arc = arc[req].dropna()
+    if len(arc) < 8:
+        return {
+            'p_12': 0.0, 'p_21': 0.0, 'p_other': 1.0,
+            'knn_12': 0.0, 'knn_21': 0.0, 'pat_12': 0.0, 'pat_21': 0.0
+        }
+
+    feat_cols = ['HT Diff_f', 'FT Diff_f', 'Asymmetry_f', 'Str Diff_f']
+
+    # Robust ölçek (IQR) — outlier etkisini azaltır
+    scales = {}
+    for c in feat_cols:
+        q1 = arc[c].quantile(0.25)
+        q3 = arc[c].quantile(0.75)
+        iqr = float(q3 - q1)
+        scales[c] = iqr if iqr > 1e-6 else 10.0
+
+    q = {'HT Diff_f': ht_diff, 'FT Diff_f': ft_diff, 'Asymmetry_f': asym, 'Str Diff_f': str_diff}
+    arc['_dist'] = arc.apply(
+        lambda r: sum(((r[c] - q[c]) / scales[c]) ** 2 for c in feat_cols) ** 0.5,
+        axis=1
+    )
+
+    top = arc.nsmallest(max(5, min(k, len(arc))), '_dist').copy()
+    top['_w'] = 1.0 / (0.35 + top['_dist'])  # çok yakın komşular daha ağır
+    tot_w = float(top['_w'].sum()) or 1.0
+
+    w12 = float(top.loc[top['actual'] == '1/2', '_w'].sum())
+    w21 = float(top.loc[top['actual'] == '2/1', '_w'].sum())
+    wot = max(tot_w - (w12 + w21), 0.0)
+    knn_12, knn_21, knn_other = w12 / tot_w, w21 / tot_w, wot / tot_w
+
+    # Domain pattern score (soft rules): hard-threshold yerine puan yaklaşımı
+    pat_12 = (
+        0.35 * _sigmoid((-str_diff - 9) / 5.5) +
+        0.25 * _sigmoid((10 - asym) / 4.5) +
+        0.20 * _sigmoid((-ft_diff - 4) / 6.0) +
+        0.20 * _sigmoid((-ht_diff + 2) / 7.0)
+    )
+    pat_21 = (
+        0.30 * _sigmoid((str_diff - 9) / 5.0) +
+        0.25 * _sigmoid((ht_diff - 4) / 6.0) +
+        0.25 * _sigmoid((ft_diff - 10) / 6.0) +
+        0.20 * _sigmoid((18 - asym) / 5.0)
+    )
+
+    p12 = 0.65 * knn_12 + 0.35 * pat_12
+    p21 = 0.65 * knn_21 + 0.35 * pat_21
+
+    # normalize
+    s = p12 + p21 + (0.60 * knn_other)
+    if s <= 1e-9:
+        return {
+            'p_12': 0.0, 'p_21': 0.0, 'p_other': 1.0,
+            'knn_12': knn_12, 'knn_21': knn_21, 'pat_12': pat_12, 'pat_21': pat_21
+        }
+    p12n = p12 / s
+    p21n = p21 / s
+    pother = max(0.0, 1.0 - (p12n + p21n))
+    return {
+        'p_12': p12n, 'p_21': p21n, 'p_other': pother,
+        'knn_12': knn_12, 'knn_21': knn_21, 'pat_12': pat_12, 'pat_21': pat_21
+    }
 
 
 def format_neighbors(neighbors, decision):
@@ -368,49 +464,48 @@ def analyze_match(soup, url):
     #    2/1-N : Str≥10 + HT≥15 + FT≥10 → Ev her metrikte üstün
     # ════════════════════════════════════════════════════════
 
-    # ── 1/2 PATERNİ ──────────────────────────────────────────
+    probs = estimate_turnaround_probabilities(diff_ht_pct, diff_ft_pct, asymmetry, diff_str)
+    p12 = probs['p_12']; p21 = probs['p_21']; pother = probs['p_other']
+    knn12 = probs['knn_12']; knn21 = probs['knn_21']
+    pat12 = probs['pat_12']; pat21 = probs['pat_21']
 
-    # [1/2-N] AWAY GÜÇ + TUTARLI BASKI
-    # Str≤-15: Away fiziksel olarak belirgin üstün
-    # Asym≤15: HT ve FT formları birbirine yakın — tutarlı away baskısı
-    # Eğitim: 8 TP / 31 maç, 0 YNL
-    if (diff_str <= -15 and asymmetry <= 15):
-        decision = "İY/MS 1/2"; level = "⚠️ 1/2-N — AWAY GÜÇ+TUTARLI"
-        confidence = "Orta"; pattern_key = "1/2_A"
+    top_dir = "1/2" if p12 >= p21 else "2/1"
+    top_p = max(p12, p21)
+    second_p = min(p12, p21)
+    margin = top_p - second_p
+
+    # Kalibrasyon: Yüksek diğer olasılığı veya düşük margin => PAS
+    signal_gate = (top_p >= 0.47 and margin >= 0.12 and pother <= 0.55)
+
+    if signal_gate and top_dir == "1/2":
+        decision = "İY/MS 1/2"; level = "⚠️ 1/2-PRO — PROBABILISTIC EDGE"
+        confidence = "Yüksek" if top_p >= 0.60 else "Orta"
+        pattern_key = "1/2_A"
         pattern_desc = (
-            f"\n⚠️ İY/MS 1/2 — 1/2-N: AWAY GÜÇ + TUTARLI BASKI\n"
+            f"\n⚠️ İY/MS 1/2 — 1/2-PRO: Olasılık + Pattern Harmanı\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"  ✅ Strength   : {diff_str:+d}  (≤-15 — Away fiziksel olarak belirgin üstün)\n"
-            f"  ✅ Asimetri   : {asymmetry:.1f}%  (≤15 — HT/FT formları tutarlı, away her iki yarıda baskılı)\n"
-            f"  ℹ️ HT Fark    : {diff_ht_pct:+.1f}%\n"
-            f"  ℹ️ FT Fark    : {diff_ft_pct:+.1f}%\n"
-            f"Mantık: Away güç + tutarlı form baskısı; ev İY'de tutunsa da dep 2. yarıda döner\n"
-            f"→ İY Home önde/eşit, MS Away kazanır (1/2)\n"
-            f"Eğitim seti: 8 TP / 31 — 0 yanlış yön ⭐"
+            f"  🎯 P(1/2)    : %{p12*100:.1f}\n"
+            f"  🎯 P(2/1)    : %{p21*100:.1f}\n"
+            f"  🎯 P(other)  : %{pother*100:.1f}\n"
+            f"  📌 Margin    : %{margin*100:.1f}\n"
+            f"  🔎 kNN(1/2)  : %{knn12*100:.1f}  |  Pattern(1/2): %{pat12*100:.1f}\n"
+            f"  ℹ️ HT/FT/Asym/Str: {diff_ht_pct:+.1f}% / {diff_ft_pct:+.1f}% / {asymmetry:.1f}% / {diff_str:+d}\n"
+            f"Mantık: Arşiv komşu yoğunluğu + yumuşak pattern puanı birlikte 1/2 lehine."
         )
-
-    # ── 2/1 PATERNİ ──────────────────────────────────────────
-
-    # [2/1-N] EV HER METRİKTE ÜSTÜN
-    # Str≥10: Ev fiziksel olarak üstün
-    # HT≥5: Ev HT formunda üstün (geniş aralık — dep İY sürprizi için alan var)
-    # FT 15~40: Ev FT formunda üstün, sınırlı aralık — çok yüksek FT dep gol atamaz
-    # Asym≤20: Formlar tutarlı
-    # Eğitim: 10 TP / 97 maç, 0 YNL
-    elif (diff_str >= 10 and diff_ht_pct >= 5 and 15 <= diff_ft_pct <= 40 and asymmetry <= 20):
-        decision = "İY/MS 2/1"; level = "⚠️ 2/1-N — EV ÜSTÜN"
-        confidence = "Orta"; pattern_key = "2/1_X1"
+    elif signal_gate and top_dir == "2/1":
+        decision = "İY/MS 2/1"; level = "⚠️ 2/1-PRO — PROBABILISTIC EDGE"
+        confidence = "Yüksek" if top_p >= 0.60 else "Orta"
+        pattern_key = "2/1_X1"
         pattern_desc = (
-            f"\n⚠️ İY/MS 2/1 — 2/1-N: EV HER METRİKTE ÜSTÜN\n"
+            f"\n⚠️ İY/MS 2/1 — 2/1-PRO: Olasılık + Pattern Harmanı\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"  ✅ Strength   : {diff_str:+d}  (≥10 — Ev fiziksel olarak üstün)\n"
-            f"  ✅ HT Fark    : {diff_ht_pct:+.1f}%  (≥5 — Ev HT formunda üstün)\n"
-            f"  ✅ FT Fark    : {diff_ft_pct:+.1f}%  (15~40 — Ev FT formunda üstün, sınırlı aralık)\n"
-            f"  ✅ Asimetri   : {asymmetry:.1f}%  (≤20 — Formlar tutarlı)\n"
-            f"Mantık: Ev güç ve form olarak üstün; FT sınırlı aralık dep için gol alanı bırakır\n"
-            f"→ İY Away önde/eşit, MS Home kazanır (2/1)\n"
-            f"⚠️ İY'de ev önde ise bahis geçersiz!\n"
-            f"Eğitim seti: 10 TP / 97 maç — 0 yanlış yön ⭐"
+            f"  🎯 P(2/1)    : %{p21*100:.1f}\n"
+            f"  🎯 P(1/2)    : %{p12*100:.1f}\n"
+            f"  🎯 P(other)  : %{pother*100:.1f}\n"
+            f"  📌 Margin    : %{margin*100:.1f}\n"
+            f"  🔎 kNN(2/1)  : %{knn21*100:.1f}  |  Pattern(2/1): %{pat21*100:.1f}\n"
+            f"  ℹ️ HT/FT/Asym/Str: {diff_ht_pct:+.1f}% / {diff_ft_pct:+.1f}% / {asymmetry:.1f}% / {diff_str:+d}\n"
+            f"Mantık: Arşiv komşu yoğunluğu + yumuşak pattern puanı birlikte 2/1 lehine."
         )
 
     # PAS
@@ -419,7 +514,7 @@ def analyze_match(soup, url):
         pattern_desc = (
             f"\n⚪ V24 — TURNAROUND BEKLENMİYOR\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Hiçbir patern tetiklenmedi.\n"
+            f"Eşik geçilmedi: Pmax=%{top_p*100:.1f}, margin=%{margin*100:.1f}, P(other)=%{pother*100:.1f}\n"
             f"  HT={diff_ht_pct:+.1f}%  FT={diff_ft_pct:+.1f}%  Asym={asymmetry:.1f}%  Str={diff_str:+d}"
         )
     else:
@@ -434,11 +529,11 @@ def analyze_match(soup, url):
         yön = "2/1" if "2/1" in decision else "1/2"
         emoji_tp = f"✅{yön}"
         k3_tp = sum(1 for n in neighbors[:3] if n[1] == emoji_tp)
-        if k3_tp < 2:
+        if k3_tp < 1:
             filtre_notu = (
                 f"\n🚫 KOMŞU FİLTRESİ — Sinyal iptal edildi\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Patern tetiklendi ({pattern_key}) ama ilk 3 komşuda 2 {yön} TP bulunamadı (k3<2).\n"
+                f"Patern tetiklendi ({pattern_key}) ama ilk 3 komşuda hiç {yön} TP bulunamadı (k3<1).\n"
                 f"Arşiv desteği yetersiz → sinyal güvenilir değil.\n"
                 f"  HT={diff_ht_pct:+.1f}%  FT={diff_ft_pct:+.1f}%  Asym={asymmetry:.1f}%  Str={diff_str:+d}"
             )
@@ -472,8 +567,8 @@ def analyze_match(soup, url):
         f"{neighbor_text}\n"
         f"{'─'*80}\n"
         f"ℹ️  V25 DEMO — Yeni metodoloji | %60 Last6 + %40 Sezon Home/Away\n"
-        f"    Eğitim: 97 maç | 1/2-N: Str≤-15+Asym≤15 (9 TP/0 YNL) | 2/1-N: Str≥10+HT≥5+FT 15~40+Asym≤20 (10 TP/0 YNL)\n"
-        f"    Komşu filtresi: k3≥2 | ⚠️  DEMO — Veri birikince B şıkkı kalibrasyonu yapılacak\n"
+        f"    Motor: Robust kNN (%65) + Soft Pattern Score (%35) + risk kapısı (Pmax/margin/Pother)\n"
+        f"    Komşu filtresi: k3≥1 | ⚠️  DEMO — Veri birikince eşikler yeniden kalibre edilmeli\n"
         f"{'═'*80}"
     )
 
