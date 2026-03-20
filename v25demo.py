@@ -332,17 +332,23 @@ def calibrate_model_params():
         }
         return _model_cache
 
+    # Performans koruması: çok büyük arşivde kalibrasyonu örnekleme ile hızlandır
+    max_calib_rows = 140
+    if len(arc) > max_calib_rows:
+        arc = arc.sample(n=max_calib_rows, random_state=42).reset_index(drop=True)
+
     best_obj = None
     best_prec = -1.0
     best_rec = -1.0
     best_neg_fp = float("-inf")
     best_params = None
     best_metrics = None
-    grid_k = [13, 17, 21, 25]
-    grid_alpha = [0.55, 0.65, 0.75]
-    grid_gate_p = [0.45, 0.47, 0.50, 0.53]
-    grid_margin = [0.10, 0.12, 0.15]
-    grid_gate_other = [0.50, 0.55, 0.60]
+    # Grid küçültüldü: GUI'de ilk analizde donma yaşamamak için
+    grid_k = [13, 21]
+    grid_alpha = [0.60, 0.70]
+    grid_gate_p = [0.47, 0.52]
+    grid_margin = [0.10, 0.14]
+    grid_gate_other = [0.55, 0.60]
 
     for k in grid_k:
         for alpha in grid_alpha:
